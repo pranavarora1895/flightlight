@@ -1,0 +1,21 @@
+{
+  "name": "flightlight",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "types": "wrangler types",
+    "check": "wrangler check",
+    "db:migrate": "wrangler d1 migrations apply DB --remote"
+  },
+  "dependencies": {
+    "hono": "^4.7.4"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250320.0",
+    "typescript": "^5.8.2",
+    "wrangler": "^4.98.0"
+  }
+}

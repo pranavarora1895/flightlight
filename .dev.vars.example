@@ -1,0 +1,5 @@
+# Secrets — copy to .dev.vars and fill in (never commit .dev.vars)
+SERPAPI_KEY=
+RESEND_API_KEY=
+INVITE_CODE=
+SESSION_SECRET=

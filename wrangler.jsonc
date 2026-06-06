@@ -1,0 +1,44 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "flight-tracker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    "FROM_EMAIL": "flights@pranavarora.dev",
+    "APP_URL": "https://flightlight.pranavarora.dev",
+    "SEARCH_TIER": "free"
+  },
+  "routes": [
+    {
+      "pattern": "flightlight.pranavarora.dev",
+      "custom_domain": true
+    }
+  ],
+  "send_email": [
+    {
+      "name": "EMAIL",
+      "allowed_sender_addresses": ["flights@pranavarora.dev"]
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "PRICE_HISTORY",
+      "id": "072fc63aefb94d838cee17c3a7047f74"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "yyt-del-flight-tracker-db",
+      "database_id": "599c1dfe-2238-400b-ad32-616e383ccda1",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "triggers": {
+    "crons": ["0 14 * * *"]
+  }
+}
