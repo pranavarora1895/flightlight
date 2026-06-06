@@ -1,17 +1,26 @@
 import {
   DEFAULT_DESTINATION,
-  DEFAULT_HUBS,
   DEFAULT_ORIGIN,
-  formatHubList,
-  parseHubList,
+  resolveHubsForRoute,
 } from "./airports";
+import {
+  DEFAULT_CHECK_INTERVAL_DAYS,
+  DEFAULT_DEPART_END,
+  DEFAULT_DEPART_START,
+  DEFAULT_MAX_STOPS,
+  DEFAULT_RETURN_END,
+  DEFAULT_RETURN_START,
+  DEFAULT_TRIP_MIN_DAYS,
+} from "./constants";
 import type { User, UserRoute } from "./types";
 
 export function userRoute(user: User): UserRoute {
+  const origin = user.origin ?? DEFAULT_ORIGIN;
+  const destination = user.destination ?? DEFAULT_DESTINATION;
   return {
-    origin: user.origin ?? DEFAULT_ORIGIN,
-    destination: user.destination ?? DEFAULT_DESTINATION,
-    hubs: parseHubList(user.hubs ?? formatHubList(DEFAULT_HUBS)),
+    origin,
+    destination,
+    hubs: resolveHubsForRoute(origin, destination),
   };
 }
 
@@ -45,15 +54,24 @@ export async function upsertUser(
   const createdAt = new Date().toISOString();
   await db
     .prepare(
-      `INSERT INTO users (id, email, origin, destination, hubs, alert_min, alert_max, active, created_at)
-       VALUES (?, ?, ?, ?, ?, 2000, 2400, 1, ?)`,
+      `INSERT INTO users (id, email, origin, destination, hubs, alert_min, alert_max, max_stops,
+        depart_start, depart_end, return_start, return_end, trip_min_days,
+        check_interval_days, auto_check, active, created_at)
+       VALUES (?, ?, ?, ?, ?, 2000, 2400, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?)`,
     )
     .bind(
       id,
       normalized,
       DEFAULT_ORIGIN,
       DEFAULT_DESTINATION,
-      formatHubList(DEFAULT_HUBS),
+      "YYZ,YUL",
+      DEFAULT_MAX_STOPS,
+      DEFAULT_DEPART_START,
+      DEFAULT_DEPART_END,
+      DEFAULT_RETURN_START,
+      DEFAULT_RETURN_END,
+      DEFAULT_TRIP_MIN_DAYS,
+      DEFAULT_CHECK_INTERVAL_DAYS,
       createdAt,
     )
     .run();
@@ -63,9 +81,17 @@ export async function upsertUser(
     email: normalized,
     origin: DEFAULT_ORIGIN,
     destination: DEFAULT_DESTINATION,
-    hubs: formatHubList(DEFAULT_HUBS),
+    hubs: "YYZ,YUL",
     alert_min: 2000,
     alert_max: 2400,
+    max_stops: DEFAULT_MAX_STOPS,
+    depart_start: DEFAULT_DEPART_START,
+    depart_end: DEFAULT_DEPART_END,
+    return_start: DEFAULT_RETURN_START,
+    return_end: DEFAULT_RETURN_END,
+    trip_min_days: DEFAULT_TRIP_MIN_DAYS,
+    check_interval_days: DEFAULT_CHECK_INTERVAL_DAYS,
+    auto_check: 1,
     active: 1,
     created_at: createdAt,
   };
@@ -76,7 +102,14 @@ function normalizeUser(user: User): User {
     ...user,
     origin: user.origin ?? DEFAULT_ORIGIN,
     destination: user.destination ?? DEFAULT_DESTINATION,
-    hubs: user.hubs ?? formatHubList(DEFAULT_HUBS),
+    max_stops: user.max_stops ?? DEFAULT_MAX_STOPS,
+    depart_start: user.depart_start ?? DEFAULT_DEPART_START,
+    depart_end: user.depart_end ?? DEFAULT_DEPART_END,
+    return_start: user.return_start ?? DEFAULT_RETURN_START,
+    return_end: user.return_end ?? DEFAULT_RETURN_END,
+    trip_min_days: user.trip_min_days ?? DEFAULT_TRIP_MIN_DAYS,
+    check_interval_days: user.check_interval_days ?? DEFAULT_CHECK_INTERVAL_DAYS,
+    auto_check: user.auto_check ?? 1,
   };
 }
 
@@ -98,27 +131,63 @@ export async function getActiveUsers(db: D1Database): Promise<User[]> {
   return (result.results ?? []).map(normalizeUser);
 }
 
+export async function setUserAutoCheck(
+  db: D1Database,
+  userId: string,
+  autoCheck: boolean,
+): Promise<void> {
+  await db
+    .prepare("UPDATE users SET auto_check = ? WHERE id = ? AND active = 1")
+    .bind(autoCheck ? 1 : 0, userId)
+    .run();
+}
+
+export async function getScheduledUsers(db: D1Database): Promise<User[]> {
+  const result = await db
+    .prepare(
+      "SELECT * FROM users WHERE active = 1 AND auto_check = 1 ORDER BY created_at ASC",
+    )
+    .all<User>();
+  return (result.results ?? []).map(normalizeUser);
+}
+
 export async function updateUserSettings(
   db: D1Database,
   userId: string,
   settings: {
     origin: string;
     destination: string;
-    hubs: string;
     alertMin: number;
     alertMax: number;
+    maxStops: number;
+    departStart: string;
+    departEnd: string;
+    returnStart: string;
+    returnEnd: string;
+    tripMinDays: number;
+    checkIntervalDays: number;
+    autoCheck: boolean;
   },
 ): Promise<void> {
   await db
     .prepare(
-      `UPDATE users SET origin = ?, destination = ?, hubs = ?, alert_min = ?, alert_max = ? WHERE id = ?`,
+      `UPDATE users SET origin = ?, destination = ?, alert_min = ?, alert_max = ?, max_stops = ?,
+        depart_start = ?, depart_end = ?, return_start = ?, return_end = ?, trip_min_days = ?,
+        check_interval_days = ?, auto_check = ? WHERE id = ?`,
     )
     .bind(
       settings.origin,
       settings.destination,
-      settings.hubs,
       settings.alertMin,
       settings.alertMax,
+      settings.maxStops,
+      settings.departStart,
+      settings.departEnd,
+      settings.returnStart,
+      settings.returnEnd,
+      settings.tripMinDays,
+      settings.checkIntervalDays,
+      settings.autoCheck ? 1 : 0,
       userId,
     )
     .run();

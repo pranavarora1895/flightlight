@@ -1,0 +1,1 @@
+ALTER TABLE users ADD COLUMN check_interval_days INTEGER NOT NULL DEFAULT 2;

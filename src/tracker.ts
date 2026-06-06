@@ -1,23 +1,35 @@
 import {
   dealKey,
   getDomesticFallback,
+  routeViaKey,
   getSearchProfile,
   isLegacyPriceRecordKey,
   isPriceRecordKey,
   KV_TTL_SECONDS,
   parseSearchTier,
-  RETURN_DATES,
   todayUtc,
 } from "./constants";
-import { getActiveUsers, userRoute } from "./db";
+import { getActiveUsers, getScheduledUsers, userRoute } from "./db";
 import { sendDealAlertEmail } from "./email";
-import { SerpapiError, searchOneWay, searchRoundTrip } from "./serpapi";
+import {
+  buildUserTripSchedule,
+  departureDatesForReturn,
+  userTripDates,
+} from "./dates";
+import { findBestItinerary } from "./optimizer";
+import { getQuotaStatus, SerpapiQuotaExhaustedError } from "./quota";
+import {
+  SerpapiError,
+  searchOneWayOptions,
+  searchRoundTripOptions,
+} from "./serpapi";
 import type {
   Deal,
   DomesticCacheEntry,
   Env,
   KVRecord,
   RunOptions,
+  FlightSearchResult,
   RunResult,
   SearchProfile,
   User,
@@ -51,8 +63,58 @@ async function setTrackerState(
   await kv.put(key, String(value));
 }
 
-async function getLastRunAt(kv: KVNamespace): Promise<string | null> {
+function userLastRunKey(userId: string): string {
+  return `tracker:lastRunAt:${userId}`;
+}
+
+export async function getUserLastCheckAt(
+  kv: KVNamespace,
+  userId: string,
+): Promise<string | null> {
+  const perUser = await kv.get(userLastRunKey(userId));
+  if (perUser) return perUser;
   return kv.get("tracker:lastRunAt");
+}
+
+async function setUserLastCheckAt(
+  kv: KVNamespace,
+  userId: string,
+  iso: string,
+): Promise<void> {
+  await kv.put(userLastRunKey(userId), iso);
+}
+
+function userIntervalMs(user: User): number {
+  return user.check_interval_days * 24 * 60 * 60 * 1000;
+}
+
+async function filterUsersDueForCheck(
+  kv: KVNamespace,
+  users: User[],
+  log: string[],
+): Promise<User[]> {
+  const due: User[] = [];
+
+  for (const user of users) {
+    const lastRunAt = await getUserLastCheckAt(kv, user.id);
+    if (!lastRunAt) {
+      due.push(user);
+      continue;
+    }
+
+    const elapsed = Date.now() - new Date(lastRunAt).getTime();
+    if (elapsed >= userIntervalMs(user)) {
+      due.push(user);
+      continue;
+    }
+
+    const hoursLeft = Math.ceil((userIntervalMs(user) - elapsed) / (60 * 60 * 1000));
+    log.push(
+      `Skipping ${user.email}: next automatic check in ~${hoursLeft}h (every ${user.check_interval_days} days)`,
+    );
+  }
+
+  return due;
 }
 
 async function tryAcquireRunLock(kv: KVNamespace): Promise<boolean> {
@@ -72,31 +134,16 @@ function formatNextRunFromLast(lastRunAt: string, intervalMs: number): string {
   return new Date(new Date(lastRunAt).getTime() + intervalMs).toISOString();
 }
 
-export async function getNextRunEstimate(env: Env): Promise<string | null> {
-  const profile = getSearchProfile(parseSearchTier(env.SEARCH_TIER));
-  const lastRunAt = await getLastRunAt(env.PRICE_HISTORY);
+export async function getNextRunEstimate(
+  env: Env,
+  user: User,
+): Promise<string | null> {
+  if (!user.auto_check) return null;
+
+  const lastRunAt = await getUserLastCheckAt(env.PRICE_HISTORY, user.id);
   if (!lastRunAt) return "Pending first run";
 
-  const next = new Date(new Date(lastRunAt).getTime() + profile.runIntervalMs);
-  return next.toISOString();
-}
-
-async function shouldSkipRun(
-  env: Env,
-  profile: SearchProfile,
-): Promise<string | null> {
-  const lastRunAt = await getLastRunAt(env.PRICE_HISTORY);
-  if (!lastRunAt) return null;
-
-  const elapsed = Date.now() - new Date(lastRunAt).getTime();
-  if (elapsed < profile.runIntervalMs) {
-    const hoursLeft = Math.ceil(
-      (profile.runIntervalMs - elapsed) / (60 * 60 * 1000),
-    );
-    return `Last run ${lastRunAt}; next run in ~${hoursLeft}h`;
-  }
-
-  return null;
+  return formatNextRunFromLast(lastRunAt, userIntervalMs(user));
 }
 
 function resolveHubsForUser(
@@ -120,16 +167,17 @@ function resolveHubsForUser(
   };
 }
 
-async function getDomesticLegPrice(
+async function getDomesticLegOptions(
   env: Env,
   profile: SearchProfile,
   from: string,
   to: string,
   date: string,
+  maxStops: number,
   log: string[],
-): Promise<{ price: number; estimated: boolean; apiCalled: boolean; bookingUrl: string }> {
+): Promise<{ options: FlightSearchResult[]; apiCalled: boolean }> {
   const fallbackBookUrl = buildDomesticBookUrl(from, to, date);
-  const cacheKey = `domestic:${from}:${to}`;
+  const cacheKey = `domestic:${from}:${to}:${date}`;
 
   if (!profile.alwaysLiveDomestic) {
     const cachedRaw = await env.PRICE_HISTORY.get(cacheKey);
@@ -137,39 +185,208 @@ async function getDomesticLegPrice(
       const cached = JSON.parse(cachedRaw) as DomesticCacheEntry;
       const age = Date.now() - new Date(cached.checkedAt).getTime();
       if (age < profile.domesticCacheMaxAgeMs) {
-        log.push(`  domestic ${from}→${to}: cache hit ${cached.price} CAD`);
-        return { price: cached.price, estimated: cached.estimated, apiCalled: false, bookingUrl: fallbackBookUrl };
+        log.push(`  domestic ${from}→${to} ${date}: cache hit ${cached.price} CAD`);
+        return {
+          options: [
+            {
+              price: cached.price,
+              airline: "Estimated",
+              bookingUrl: fallbackBookUrl,
+              stops: 0,
+              routePath: [from.toUpperCase(), to.toUpperCase()],
+              estimated: true,
+            },
+          ],
+          apiCalled: false,
+        };
       }
     }
   }
 
   try {
-    const result = await searchOneWay(env, from, to, date);
-    if (result) {
+    const results = await searchOneWayOptions(env, from, to, date, maxStops);
+    if (results.length > 0) {
+      const best = results[0];
       const entry: DomesticCacheEntry = {
-        price: result.price,
+        price: best.price,
         checkedAt: new Date().toISOString(),
         estimated: false,
       };
       await env.PRICE_HISTORY.put(cacheKey, JSON.stringify(entry), {
         expirationTtl: KV_TTL_SECONDS,
       });
-      log.push(`  domestic ${from}→${to}: live ${result.price} CAD`);
-      return {
-        price: result.price,
-        estimated: false,
-        apiCalled: true,
-        bookingUrl: result.bookingUrl,
-      };
+      log.push(
+        `  domestic ${from}→${to} ${date}: live ${results.length} option(s), best ${best.price} CAD (${best.stops} stop${best.stops === 1 ? "" : "s"})`,
+      );
+      return { options: results, apiCalled: true };
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    log.push(`  domestic ${from}→${to}: API error (${message}), using fallback`);
+    log.push(`  domestic ${from}→${to} ${date}: API error (${message}), using fallback`);
   }
 
   const fallback = getDomesticFallback(from, to);
-  log.push(`  domestic ${from}→${to}: fallback ${fallback} CAD`);
-  return { price: fallback, estimated: true, apiCalled: false, bookingUrl: fallbackBookUrl };
+  log.push(`  domestic ${from}→${to} ${date}: fallback ${fallback} CAD`);
+  return {
+    options: [
+      {
+        price: fallback,
+        airline: "Estimated",
+        bookingUrl: fallbackBookUrl,
+        stops: 0,
+        routePath: [from.toUpperCase(), to.toUpperCase()],
+        estimated: true,
+      },
+    ],
+    apiCalled: false,
+  };
+}
+
+function mergeRoutePaths(segments: string[][]): string[] {
+  const merged: string[] = [];
+  for (const segment of segments) {
+    for (const code of segment) {
+      const upper = code.toUpperCase();
+      if (merged.length === 0 || merged[merged.length - 1] !== upper) {
+        merged.push(upper);
+      }
+    }
+  }
+  return merged;
+}
+
+function displayHub(routePath: string[], origin: string): string {
+  if (routePath.length > 2) return routePath[1];
+  return origin.toUpperCase();
+}
+
+function recordFromDirect(
+  user: User,
+  route: { origin: string; destination: string },
+  depDate: string,
+  retDate: string,
+  best: FlightSearchResult,
+): KVRecord {
+  const routePath = best.routePath;
+  return {
+    userId: user.id,
+    origin: route.origin,
+    destination: route.destination,
+    checkedAt: new Date().toISOString(),
+    hub: displayHub(routePath, route.origin),
+    routePath,
+    depDate,
+    retDate,
+    intlPrice: best.price,
+    domesticPrice: 0,
+    domesticEstimated: false,
+    totalPrice: best.price,
+    airline: best.airline,
+    totalStops: best.stops,
+    intlStops: best.stops,
+    domesticStops: 0,
+    intlBookingUrl: best.bookingUrl,
+  };
+}
+
+function recordFromSplit(
+  user: User,
+  route: { origin: string; destination: string },
+  depDate: string,
+  retDate: string,
+  best: ReturnType<typeof findBestItinerary> & object,
+): KVRecord {
+  const segments: string[][] = [];
+  if (best.outbound) segments.push(best.outbound.routePath);
+  segments.push(best.intl.routePath);
+  const routePath = mergeRoutePaths(segments);
+
+  return {
+    userId: user.id,
+    origin: route.origin,
+    destination: route.destination,
+    checkedAt: new Date().toISOString(),
+    hub: displayHub(routePath, route.origin),
+    routePath,
+    depDate,
+    retDate,
+    intlPrice: best.intl.price,
+    domesticPrice: best.domesticPrice,
+    domesticEstimated: best.domesticEstimated,
+    totalPrice: best.totalPrice,
+    airline: best.intl.airline,
+    totalStops: best.totalStops,
+    intlStops: best.intl.stops,
+    domesticStops: best.domesticStops,
+    intlBookingUrl: best.intl.bookingUrl,
+    domesticOutboundBookingUrl: best.outbound?.bookingUrl,
+    domesticReturnBookingUrl: best.inbound?.bookingUrl,
+  };
+}
+
+async function trySplitItinerary(
+  env: Env,
+  profile: SearchProfile,
+  route: { origin: string; destination: string },
+  hub: string,
+  depDate: string,
+  retDate: string,
+  maxStops: number,
+  log: string[],
+): Promise<{ itinerary: NonNullable<ReturnType<typeof findBestItinerary>>; searchCount: number } | null> {
+  let searchCount = 0;
+  const intlOptions = await searchRoundTripOptions(
+    env,
+    hub,
+    route.destination,
+    depDate,
+    retDate,
+    maxStops,
+  );
+  searchCount += 1;
+  if (intlOptions.length === 0) return null;
+
+  const needsDomestic = route.origin !== hub;
+  let outboundOptions: FlightSearchResult[] = [];
+  let inboundOptions: FlightSearchResult[] = [];
+
+  if (needsDomestic) {
+    const outbound = await getDomesticLegOptions(
+      env,
+      profile,
+      route.origin,
+      hub,
+      depDate,
+      maxStops,
+      log,
+    );
+    if (outbound.apiCalled) searchCount += 1;
+
+    const inbound = await getDomesticLegOptions(
+      env,
+      profile,
+      hub,
+      route.origin,
+      retDate,
+      maxStops,
+      log,
+    );
+    if (inbound.apiCalled) searchCount += 1;
+
+    outboundOptions = outbound.options;
+    inboundOptions = inbound.options;
+  }
+
+  const itinerary = findBestItinerary(
+    intlOptions,
+    outboundOptions,
+    inboundOptions,
+    maxStops,
+    needsDomestic,
+  );
+  if (!itinerary) return null;
+
+  return { itinerary, searchCount };
 }
 
 async function savePriceRecord(
@@ -177,7 +394,8 @@ async function savePriceRecord(
   runDate: string,
   record: KVRecord,
 ): Promise<Deal> {
-  const key = `${runDate}:${record.userId}:${record.origin}:${record.hub}:${record.destination}:${record.depDate}:${record.retDate}`;
+  const via = routeViaKey(record.routePath, record.hub);
+  const key = `${runDate}:${record.userId}:${record.origin}:${via}:${record.destination}:${record.depDate}:${record.retDate}`;
   await kv.put(key, JSON.stringify(record), { expirationTtl: KV_TTL_SECONDS });
   return { ...record, dealKey: dealKey(record), kvKey: key };
 }
@@ -193,108 +411,123 @@ async function runForUser(
 ): Promise<{ deals: Deal[]; searchCount: number; nextHubIndex: number }> {
   const route = userRoute(user);
   const { hubs, nextHubIndex } = resolveHubsForUser(profile, user, hubIndex);
-
-  if (hubs.length === 0) {
-    log.push(`User ${user.email}: no connection hubs configured, skipping.`);
-    return { deals: [], searchCount: 0, nextHubIndex };
-  }
+  const schedule = buildUserTripSchedule(user, profile);
+  const trip = userTripDates(user);
+  const departureDates = departureDatesForReturn(schedule, retDate);
 
   const deals: Deal[] = [];
   let searchCount = 0;
 
+  const maxStops = user.max_stops ?? 2;
   log.push(
-    `User ${user.email}: ${route.origin}→[${hubs.join("|")}]→${route.destination} ret=${retDate}`,
+    `User ${user.email}: ${route.origin}→${route.destination} dep=${trip.departStart}..${trip.departEnd} ret=${retDate} minAway=${trip.tripMinDays}d maxStops=${maxStops}${hubs.length > 0 ? ` splitFallback=[${hubs.join("|")}]` : ""}`,
   );
 
-  for (const hub of hubs) {
-    for (const depDate of profile.departureDates) {
-      log.push(`  Checking via ${hub} dep=${depDate}`);
+  if (departureDates.length === 0) {
+    log.push(
+      `  No departures for return ${retDate} with min ${trip.tripMinDays} day(s) away — skipping.`,
+    );
+    return { deals, searchCount, nextHubIndex };
+  }
 
+  for (const depDate of departureDates) {
+    log.push(`  Checking dep=${depDate}`);
+
+    let bestRecord: KVRecord | null = null;
+    let bestLog = "";
+
+    try {
+      const directOptions = await searchRoundTripOptions(
+        env,
+        route.origin,
+        route.destination,
+        depDate,
+        retDate,
+        maxStops,
+      );
+      searchCount += 1;
+
+      if (directOptions.length > 0) {
+        const direct = directOptions[0];
+        bestRecord = recordFromDirect(user, route, depDate, retDate, direct);
+        bestLog = `    direct ${direct.routePath.join("→")} = ${direct.price} CAD (${direct.stops} stop${direct.stops === 1 ? "" : "s"})`;
+      } else {
+        log.push(`    no direct results within ${maxStops} stop(s)`);
+      }
+    } catch (error) {
+      if (error instanceof SerpapiQuotaExhaustedError) {
+        throw error;
+      }
+      const message =
+        error instanceof SerpapiError
+          ? error.message
+          : error instanceof Error
+            ? error.message
+            : String(error);
+      log.push(`    direct search error: ${message}`);
+      console.error(
+        `[tracker] user=${user.email} direct dep=${depDate}`,
+        error,
+      );
+    }
+
+    for (const hub of hubs) {
       try {
-        const intl = await searchRoundTrip(
+        const split = await trySplitItinerary(
           env,
+          profile,
+          route,
           hub,
-          route.destination,
           depDate,
           retDate,
+          maxStops,
+          log,
         );
-        searchCount += 1;
-        if (!intl) {
-          log.push("    no international results");
+        if (!split) {
+          log.push(`    split via ${hub}: no results`);
           continue;
         }
 
-        let domesticPrice = 0;
-        let domesticEstimated = false;
-        let domesticOutboundBookingUrl: string | undefined;
-        let domesticReturnBookingUrl: string | undefined;
-
-        if (route.origin !== hub) {
-          const outbound = await getDomesticLegPrice(
-            env,
-            profile,
-            route.origin,
-            hub,
-            depDate,
-            log,
-          );
-          if (outbound.apiCalled) searchCount += 1;
-          domesticOutboundBookingUrl = outbound.bookingUrl;
-
-          const inbound = await getDomesticLegPrice(
-            env,
-            profile,
-            hub,
-            route.origin,
-            retDate,
-            log,
-          );
-          if (inbound.apiCalled) searchCount += 1;
-          domesticReturnBookingUrl = inbound.bookingUrl;
-
-          domesticPrice = outbound.price + inbound.price;
-          domesticEstimated = outbound.estimated || inbound.estimated;
-        }
-
-        const totalPrice = intl.price + domesticPrice;
-
-        const record: KVRecord = {
-          userId: user.id,
-          origin: route.origin,
-          destination: route.destination,
-          checkedAt: new Date().toISOString(),
-          hub,
+        searchCount += split.searchCount;
+        const splitRecord = recordFromSplit(
+          user,
+          route,
           depDate,
           retDate,
-          intlPrice: intl.price,
-          domesticPrice,
-          domesticEstimated,
-          totalPrice,
-          airline: intl.airline,
-          intlBookingUrl: intl.bookingUrl,
-          domesticOutboundBookingUrl,
-          domesticReturnBookingUrl,
-        };
-
-        const deal = await savePriceRecord(env.PRICE_HISTORY, runDate, record);
-        deals.push(deal);
-        log.push(
-          `    total=${totalPrice} CAD (intl=${intl.price} + connection=${domesticPrice}${domesticEstimated ? " est" : ""})`,
+          split.itinerary,
         );
+
+        if (!bestRecord || splitRecord.totalPrice < bestRecord.totalPrice) {
+          bestRecord = splitRecord;
+          const path = splitRecord.routePath?.join("→") ?? `${route.origin}→${hub}→${route.destination}`;
+          bestLog = `    split ${path} = ${splitRecord.totalPrice} CAD (${splitRecord.totalStops} stop${splitRecord.totalStops === 1 ? "" : "s"}${splitRecord.domesticEstimated ? " est" : ""})`;
+        }
       } catch (error) {
+        if (error instanceof SerpapiQuotaExhaustedError) {
+          throw error;
+        }
         const message =
           error instanceof SerpapiError
             ? error.message
             : error instanceof Error
               ? error.message
               : String(error);
-        log.push(`    error: ${message}`);
+        log.push(`    split via ${hub} error: ${message}`);
         console.error(
           `[tracker] user=${user.email} hub=${hub} dep=${depDate}`,
           error,
         );
       }
     }
+
+    if (!bestRecord) {
+      log.push(`    no itinerary for dep=${depDate}`);
+      continue;
+    }
+
+    const deal = await savePriceRecord(env.PRICE_HISTORY, runDate, bestRecord);
+    deals.push(deal);
+    log.push(bestLog);
   }
 
   return { deals, searchCount, nextHubIndex };
@@ -379,16 +612,25 @@ export async function runTracker(
 
   log.push(`Starting tracker tier=${tier} (${profile.label})`);
 
-  if (!options.skipIntervalGate) {
-    const skipReason = await shouldSkipRun(env, profile);
-    if (skipReason) {
-      log.push(`Skipped: ${skipReason}`);
-      return { skipped: true, skipReason, log, deals: [], searchCount: 0, tier };
-    }
-  } else if (options.manual) {
-    log.push("Manual run — automatic schedule resets after this completes.");
-  } else if (tier === "free") {
-    log.push("Manual run on free tier — watch Serpapi quota.");
+  const quota = await getQuotaStatus(env);
+  log.push(`Serpapi usage this month: ${quota.used}/${quota.limit}`);
+  if (quota.exhausted) {
+    const skipReason = `Serpapi search limit reached for ${quota.month} (${quota.used}/${quota.limit}). Paused until next month.`;
+    log.push(`Skipped: ${skipReason}`);
+    return {
+      skipped: true,
+      skipReason,
+      quotaExhausted: true,
+      log,
+      deals: [],
+      searchCount: 0,
+      usersChecked: 0,
+      tier,
+    };
+  }
+
+  if (options.manual) {
+    log.push("Manual run — resets each user's automatic schedule after this completes.");
   }
 
   const lockAcquired = await tryAcquireRunLock(env.PRICE_HISTORY);
@@ -397,76 +639,153 @@ export async function runTracker(
       ? "A price check is already running. Try again in a few minutes."
       : "Skipped: another run is already in progress";
     log.push(skipReason);
-    return { skipped: true, skipReason, log, deals: [], searchCount: 0, tier };
+    return {
+      skipped: true,
+      skipReason,
+      log,
+      deals: [],
+      searchCount: 0,
+      usersChecked: 0,
+      tier,
+    };
   }
 
   try {
-    const users = await getActiveUsers(env.DB);
+    let users = options.manual
+      ? await getActiveUsers(env.DB)
+      : await getScheduledUsers(env.DB);
+
     if (users.length === 0) {
-      log.push("No active users.");
-      return { skipped: false, log, deals: [], searchCount: 0, tier };
+      const skipReason = options.manual
+        ? "No active users."
+        : "Automatic checks paused — no users have automatic tracking enabled.";
+      log.push(skipReason);
+      return {
+        skipped: true,
+        skipReason,
+        log,
+        deals: [],
+        searchCount: 0,
+        usersChecked: 0,
+        tier,
+      };
     }
 
-    const returnIndex = await getTrackerState(
-      env.PRICE_HISTORY,
-      "tracker:returnDateIndex",
-      0,
-    );
-    const retDate = RETURN_DATES[returnIndex % RETURN_DATES.length];
+    if (!options.manual) {
+      users = await filterUsersDueForCheck(env.PRICE_HISTORY, users, log);
+      if (users.length === 0) {
+        const skipReason = "No users due for automatic check yet.";
+        log.push(`Skipped: ${skipReason}`);
+        return {
+          skipped: true,
+          skipReason,
+          log,
+          deals: [],
+          searchCount: 0,
+          usersChecked: 0,
+          tier,
+        };
+      }
+    }
+
     const runDate = todayUtc();
     const allDeals: Deal[] = [];
-
-    log.push(`Return date: ${retDate}`);
+    const usersToCheck = users.length;
+    let usersProcessed = 0;
 
     for (const user of users) {
-      const hubIndex = await getTrackerState(
-        env.PRICE_HISTORY,
-        `tracker:hubIndex:${user.id}`,
-        0,
-      );
+      try {
+        const schedule = buildUserTripSchedule(user, profile);
+        const returnIndex = await getTrackerState(
+          env.PRICE_HISTORY,
+          `tracker:returnDateIndex:${user.id}`,
+          0,
+        );
+        const retDate =
+          schedule.returnDates[
+            returnIndex % Math.max(schedule.returnDates.length, 1)
+          ];
+        if (!retDate) {
+          log.push(`User ${user.email}: no return dates in window — skipping.`);
+          continue;
+        }
 
-      const result = await runForUser(
-        env,
-        user,
-        profile,
-        retDate,
-        runDate,
-        hubIndex,
-        log,
-      );
-      searchCount += result.searchCount;
-      allDeals.push(...result.deals);
-
-      if (profile.hubsPerRun === "rotate") {
-        await setTrackerState(
+        const hubIndex = await getTrackerState(
           env.PRICE_HISTORY,
           `tracker:hubIndex:${user.id}`,
-          result.nextHubIndex,
+          0,
         );
-      }
 
-      try {
-        await dispatchAlertsForUser(env, user, result.deals, log);
+        const result = await runForUser(
+          env,
+          user,
+          profile,
+          retDate,
+          runDate,
+          hubIndex,
+          log,
+        );
+        searchCount += result.searchCount;
+        allDeals.push(...result.deals);
+
+        if (profile.hubsPerRun === "rotate") {
+          await setTrackerState(
+            env.PRICE_HISTORY,
+            `tracker:hubIndex:${user.id}`,
+            result.nextHubIndex,
+          );
+        }
+
+        await setTrackerState(
+          env.PRICE_HISTORY,
+          `tracker:returnDateIndex:${user.id}`,
+          schedule.returnDates.length > 0
+            ? (returnIndex + 1) % schedule.returnDates.length
+            : 0,
+        );
+
+        try {
+          await dispatchAlertsForUser(env, user, result.deals, log);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          log.push(`Alert error for ${user.email}: ${message}`);
+          console.error("[tracker] alert failed", error);
+        }
+
+        const checkedAt = new Date().toISOString();
+        await setUserLastCheckAt(env.PRICE_HISTORY, user.id, checkedAt);
+        usersProcessed += 1;
+        log.push(
+          `  ${user.email}: next automatic check after ${user.check_interval_days} day${user.check_interval_days === 1 ? "" : "s"}`,
+        );
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        log.push(`Alert error for ${user.email}: ${message}`);
-        console.error("[tracker] alert failed", error);
+        if (error instanceof SerpapiQuotaExhaustedError) {
+          log.push(error.message);
+          return {
+            skipped: true,
+            skipReason: error.message,
+            quotaExhausted: true,
+            log,
+            deals: allDeals,
+            searchCount,
+            usersChecked: usersProcessed,
+            tier,
+          };
+        }
+        throw error;
       }
     }
 
-    const lastRunAt = new Date().toISOString();
-    await env.PRICE_HISTORY.put("tracker:lastRunAt", lastRunAt);
-    await setTrackerState(
-      env.PRICE_HISTORY,
-      "tracker:returnDateIndex",
-      (returnIndex + 1) % RETURN_DATES.length,
-    );
-
-    const nextRunAt = formatNextRunFromLast(lastRunAt, profile.runIntervalMs);
     log.push(`Completed ${searchCount} Serpapi searches, ${allDeals.length} deals saved.`);
-    log.push(`Next automatic check: ${nextRunAt}`);
 
-    return { skipped: false, log, deals: allDeals, searchCount, tier };
+    return {
+      skipped: false,
+      log,
+      deals: allDeals,
+      searchCount,
+      usersChecked: usersToCheck,
+      tier,
+    };
   } finally {
     await releaseRunLock(env.PRICE_HISTORY);
   }

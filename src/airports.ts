@@ -53,4 +53,25 @@ export function formatHubList(hubs: string[]): string {
 
 export const DEFAULT_ORIGIN = "YYT";
 export const DEFAULT_DESTINATION = "DEL";
-export const DEFAULT_HUBS = ["YYZ", "YUL"];
+
+/** Major airports where international flights typically depart (no domestic connection needed). */
+const MAJOR_INTL_HUBS = new Set(["YYZ", "YUL", "YVR", "YYC", "YOW", "YWG"]);
+
+/** Default connection airports when origin is a smaller Canadian city. */
+const DEFAULT_CONNECTION_HUBS = ["YYZ", "YUL"];
+
+/**
+ * Pick connection hub(s) automatically from origin → destination.
+ * Users only set from/to; the tracker tries sensible hub options behind the scenes.
+ */
+export function resolveHubsForRoute(origin: string, destination: string): string[] {
+  const from = normalizeIata(origin);
+  const to = normalizeIata(destination);
+  if (from === to) return [];
+
+  if (MAJOR_INTL_HUBS.has(from)) {
+    return [from];
+  }
+
+  return [...DEFAULT_CONNECTION_HUBS];
+}

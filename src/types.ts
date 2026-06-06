@@ -1,3 +1,5 @@
+import type { GlobalScheduleStatus } from "./schedule";
+
 export type SearchTier = "free" | "paid";
 
 export type Hub = string;
@@ -23,6 +25,14 @@ export interface User {
   hubs: string;
   alert_min: number;
   alert_max: number;
+  max_stops: number;
+  depart_start: string;
+  depart_end: string;
+  return_start: string;
+  return_end: string;
+  trip_min_days: number;
+  check_interval_days: number;
+  auto_check: number;
   active: number;
   created_at: string;
 }
@@ -46,6 +56,10 @@ export interface KVRecord {
   domesticEstimated: boolean;
   totalPrice: number;
   airline: string;
+  routePath?: string[];
+  totalStops?: number;
+  intlStops?: number;
+  domesticStops?: number;
   intlBookingUrl?: string;
   domesticOutboundBookingUrl?: string;
   domesticReturnBookingUrl?: string;
@@ -64,7 +78,7 @@ export interface DomesticCacheEntry {
 
 export interface SearchProfile {
   tier: SearchTier;
-  departureDates: string[];
+  departureDateCount: number;
   hubsPerRun: "all" | "rotate";
   runIntervalMs: number;
   alwaysLiveDomestic: boolean;
@@ -73,14 +87,28 @@ export interface SearchProfile {
   label: string;
 }
 
+export interface SerpapiAirportRef {
+  id?: string;
+  name?: string;
+}
+
 export interface SerpapiFlightLeg {
   airline?: string;
   flight_number?: string;
+  departure_airport?: SerpapiAirportRef;
+  arrival_airport?: SerpapiAirportRef;
+}
+
+export interface SerpapiLayover {
+  duration?: number;
+  name?: string;
+  id?: string;
 }
 
 export interface SerpapiFlightOption {
   price?: number;
   flights?: SerpapiFlightLeg[];
+  layovers?: SerpapiLayover[];
   airline?: string;
   departure_token?: string;
   booking_token?: string;
@@ -104,6 +132,9 @@ export interface FlightSearchResult {
   price: number;
   airline: string;
   bookingUrl: string;
+  stops: number;
+  routePath: string[];
+  estimated?: boolean;
 }
 
 export interface RunOptions {
@@ -114,9 +145,11 @@ export interface RunOptions {
 export interface RunResult {
   skipped: boolean;
   skipReason?: string;
+  quotaExhausted?: boolean;
   log: string[];
   deals: Deal[];
   searchCount: number;
+  usersChecked: number;
   tier: SearchTier;
 }
 
@@ -125,7 +158,12 @@ export interface DashboardContext {
   records: KVRecord[];
   lastRunAt: string | null;
   nextRunEstimate: string | null;
+  globalSchedule: GlobalScheduleStatus;
   tierLabel: string;
+  quotaUsed: number;
+  quotaLimit: number;
+  quotaExhausted: boolean;
+  showQuotaPopup: boolean;
   message?: string;
   error?: string;
 }

@@ -1,16 +1,16 @@
 import { Hono } from "hono";
-import {
-  formatHubList,
-  isValidIata,
-  normalizeIata,
-  parseHubList,
-} from "./airports";
+import { isValidIata, normalizeIata } from "./airports";
 import {
   ALERT_MAX_BOUND,
   ALERT_MIN_BOUND,
   getSearchProfile,
+  MAX_CHECK_INTERVAL_DAYS,
+  MAX_STOPS_MAX,
+  MAX_STOPS_MIN,
+  MIN_CHECK_INTERVAL_DAYS,
   parseSearchTier,
 } from "./constants";
+import { validateTripDateSettings } from "./dates";
 import {
   clearSessionCookie,
   getSessionUser,
@@ -18,10 +18,21 @@ import {
   logout,
   verifyMagicLink,
 } from "./auth";
-import { updateUserSettings } from "./db";
+import {
+  getUserById,
+  setUserAutoCheck,
+  updateUserSettings,
+} from "./db";
 import { EmailDeliveryError } from "./email";
 import { dashboardPage, loginPage } from "./html";
-import { getNextRunEstimate, listPriceRecords, runTracker } from "./tracker";
+import { getQuotaStatus } from "./quota";
+import { getGlobalScheduleStatus, recordCronInvocation } from "./schedule";
+import {
+  getNextRunEstimate,
+  getUserLastCheckAt,
+  listPriceRecords,
+  runTracker,
+} from "./tracker";
 import type { Env } from "./types";
 
 const app = new Hono<{ Bindings: Env }>();
@@ -29,6 +40,13 @@ const app = new Hono<{ Bindings: Env }>();
 function isSecure(request: Request): boolean {
   const url = new URL(request.url);
   return url.protocol === "https:" || url.hostname === "localhost";
+}
+
+function formatNextRunMessage(value: string): string {
+  if (value === "Pending first run") return value;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString();
 }
 
 app.get("/health", (c) => c.text("OK"));
@@ -107,9 +125,13 @@ app.get("/dashboard", async (c) => {
   if (!user) return c.redirect("/", 302);
 
   const records = await listPriceRecords(c.env.PRICE_HISTORY, user.id);
-  const lastRunAt = await c.env.PRICE_HISTORY.get("tracker:lastRunAt");
-  const nextRunEstimate = await getNextRunEstimate(c.env);
+  const lastRunAt = await getUserLastCheckAt(c.env.PRICE_HISTORY, user.id);
+  const nextRunEstimate = await getNextRunEstimate(c.env, user);
+  const globalSchedule = await getGlobalScheduleStatus(c.env);
   const profile = getSearchProfile(parseSearchTier(c.env.SEARCH_TIER));
+  const quota = await getQuotaStatus(c.env);
+  const showQuotaPopup =
+    quota.exhausted || c.req.query("quota_exhausted") === "1";
 
   return c.html(
     dashboardPage(
@@ -118,7 +140,12 @@ app.get("/dashboard", async (c) => {
         records,
         lastRunAt,
         nextRunEstimate,
+        globalSchedule,
         tierLabel: profile.label,
+        quotaUsed: quota.used,
+        quotaLimit: quota.limit,
+        quotaExhausted: quota.exhausted,
+        showQuotaPopup,
         message: c.req.query("message") ?? undefined,
         error: c.req.query("error") ?? undefined,
       },
@@ -134,9 +161,19 @@ app.post("/settings", async (c) => {
   const form = await c.req.parseBody();
   const origin = normalizeIata(String(form.origin ?? ""));
   const destination = normalizeIata(String(form.destination ?? ""));
-  const hubs = parseHubList(String(form.hubs ?? ""));
   const alertMin = Number.parseInt(String(form.alert_min ?? ""), 10);
   const alertMax = Number.parseInt(String(form.alert_max ?? ""), 10);
+  const maxStops = Number.parseInt(String(form.max_stops ?? ""), 10);
+  const autoCheck = form.auto_check === "1" || form.auto_check === "on";
+  const checkIntervalDays = Number.parseInt(
+    String(form.check_interval_days ?? ""),
+    10,
+  );
+  const departStart = String(form.depart_start ?? "").trim();
+  const departEnd = String(form.depart_end ?? "").trim();
+  const returnStart = String(form.return_start ?? "").trim();
+  const returnEnd = String(form.return_end ?? "").trim();
+  const tripMinDays = Number.parseInt(String(form.trip_min_days ?? ""), 10);
 
   if (!isValidIata(origin) || !isValidIata(destination)) {
     return c.redirect(
@@ -148,13 +185,6 @@ app.post("/settings", async (c) => {
   if (origin === destination) {
     return c.redirect(
       "/dashboard?error=Origin+and+destination+must+be+different.",
-      302,
-    );
-  }
-
-  if (hubs.length === 0) {
-    return c.redirect(
-      "/dashboard?error=Add+at+least+one+connection+hub+(e.g.+YYZ,+YUL).",
       302,
     );
   }
@@ -172,14 +202,79 @@ app.post("/settings", async (c) => {
     );
   }
 
+  if (
+    !Number.isFinite(maxStops) ||
+    maxStops < MAX_STOPS_MIN ||
+    maxStops > MAX_STOPS_MAX
+  ) {
+    return c.redirect(
+      `/dashboard?error=Max+stops+must+be+between+${MAX_STOPS_MIN}+and+${MAX_STOPS_MAX}.`,
+      302,
+    );
+  }
+
+  if (
+    !Number.isFinite(checkIntervalDays) ||
+    checkIntervalDays < MIN_CHECK_INTERVAL_DAYS ||
+    checkIntervalDays > MAX_CHECK_INTERVAL_DAYS
+  ) {
+    return c.redirect(
+      `/dashboard?error=Check+interval+must+be+between+${MIN_CHECK_INTERVAL_DAYS}+and+${MAX_CHECK_INTERVAL_DAYS}+days.`,
+      302,
+    );
+  }
+
+  const dateError = validateTripDateSettings({
+    departStart,
+    departEnd,
+    returnStart,
+    returnEnd,
+    tripMinDays,
+  });
+  if (dateError) {
+    return c.redirect(`/dashboard?error=${encodeURIComponent(dateError)}`, 302);
+  }
+
   await updateUserSettings(c.env.DB, user.id, {
     origin,
     destination,
-    hubs: formatHubList(hubs),
     alertMin,
     alertMax,
+    maxStops,
+    departStart,
+    departEnd,
+    returnStart,
+    returnEnd,
+    tripMinDays,
+    checkIntervalDays,
+    autoCheck,
   });
   return c.redirect("/dashboard?message=Your+trip+settings+were+saved.", 302);
+});
+
+app.post("/cron/user/toggle", async (c) => {
+  const actor = await getSessionUser(c.env, c.req.raw);
+  if (!actor) return c.redirect("/", 302);
+
+  const form = await c.req.parseBody();
+  const userId = String(form.user_id ?? "").trim();
+  const enable = form.enable === "1";
+
+  if (!userId) {
+    return c.redirect("/dashboard?error=Missing+user.", 302);
+  }
+
+  const target = await getUserById(c.env.DB, userId);
+  if (!target || !target.active) {
+    return c.redirect("/dashboard?error=User+not+found.", 302);
+  }
+
+  await setUserAutoCheck(c.env.DB, userId, enable);
+  const message = enable
+    ? `Automatic checks resumed for ${target.email}.`
+    : `Automatic checks paused for ${target.email}. Manual Run now still works.`;
+
+  return c.redirect(`/dashboard?message=${encodeURIComponent(message)}`, 302);
 });
 
 app.get("/run", async (c) => {
@@ -192,19 +287,18 @@ app.get("/run", async (c) => {
   });
 
   if (result.skipped) {
+    const quotaParam = result.quotaExhausted ? "&quota_exhausted=1" : "";
     return c.redirect(
-      `/dashboard?error=${encodeURIComponent(result.skipReason ?? "Run skipped")}`,
+      `/dashboard?error=${encodeURIComponent(result.skipReason ?? "Run skipped")}${quotaParam}`,
       302,
     );
   }
 
-  const nextLine = result.log.find((line) =>
-    line.startsWith("Next automatic check:"),
-  );
-  const nextRunAt = nextLine?.slice("Next automatic check: ".length);
-  const message = nextRunAt
-    ? `Price check complete. Next automatic check ${new Date(nextRunAt).toLocaleString()}.`
-    : "Price check complete.";
+  const nextRunAt = await getNextRunEstimate(c.env, user);
+  const message =
+    nextRunAt && nextRunAt !== "Pending first run"
+      ? `Price check complete. Next automatic check ${formatNextRunMessage(nextRunAt)}.`
+      : "Price check complete.";
 
   return c.redirect(
     `/dashboard?message=${encodeURIComponent(message)}`,
@@ -219,6 +313,16 @@ export default {
     env: Env,
     ctx: ExecutionContext,
   ): Promise<void> {
-    ctx.waitUntil(runTracker(env, { skipIntervalGate: false }));
+    ctx.waitUntil(
+      (async () => {
+        const result = await runTracker(env, { skipIntervalGate: false });
+        await recordCronInvocation(env.PRICE_HISTORY, {
+          skipped: result.skipped,
+          skipReason: result.skipReason,
+          usersChecked: result.usersChecked,
+          searchCount: result.searchCount,
+        });
+      })(),
+    );
   },
 };

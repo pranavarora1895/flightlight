@@ -91,6 +91,8 @@ export async function getSessionUser(
   env: Env,
   request: Request,
 ): Promise<User | null> {
+  if (!env.SESSION_SECRET) return null;
+
   const cookies = parseCookies(request.headers.get("Cookie"));
   const raw = cookies[SESSION_COOKIE];
   if (!raw) return null;
@@ -98,10 +100,13 @@ export async function getSessionUser(
   const [token, signature] = raw.split(".");
   if (!token || !signature) return null;
 
-  const valid = await verifySignature(env.SESSION_SECRET, token, signature);
-  if (!valid) return null;
-
-  return getUserBySessionToken(env.DB, token);
+  try {
+    const valid = await verifySignature(env.SESSION_SECRET, token, signature);
+    if (!valid) return null;
+    return getUserBySessionToken(env.DB, token);
+  } catch {
+    return null;
+  }
 }
 
 export async function createSignedSession(

@@ -127,6 +127,9 @@ export async function sendMagicLinkEmail(
 }
 
 function routeLabel(d: Deal): string {
+  if (d.routePath && d.routePath.length >= 2) {
+    return d.routePath.join(" → ");
+  }
   const origin = d.origin ?? "YYT";
   const dest = d.destination ?? "DEL";
   if (origin === d.hub) return `${origin} → ${dest}`;
@@ -135,6 +138,20 @@ function routeLabel(d: Deal): string {
 
 function bookLinksCell(d: Deal): string {
   const links: string[] = [];
+  const origin = d.origin ?? "YYT";
+  const dest = d.destination ?? "DEL";
+  const isSplitTicket =
+    d.domesticPrice > 0 ||
+    Boolean(d.domesticOutboundBookingUrl || d.domesticReturnBookingUrl);
+
+  if (!isSplitTicket) {
+    const url =
+      d.intlBookingUrl ??
+      `https://www.google.com/travel/flights/search?q=${encodeURIComponent(`Flights from ${origin} to ${dest} on ${d.depDate} returning ${d.retDate}`)}&curr=CAD`;
+    links.push(`<a href="${escapeHtml(url)}" style="color:#22c55e;">Book trip</a>`);
+    return links.join(" · ");
+  }
+
   const intlUrl =
     d.intlBookingUrl ??
     `https://www.google.com/travel/flights/search?q=${encodeURIComponent(`Flights from ${d.hub} to ${d.destination} on ${d.depDate} returning ${d.retDate}`)}&curr=CAD`;

@@ -1,5 +1,15 @@
-import { API_DELAY_MS, sleep } from "./constants";
-import type { Env, FlightSearchResult, SerpapiResponse } from "./types";
+import { API_DELAY_MS, OPTIONS_PER_SEARCH, sleep } from "./constants";
+import {
+  assertQuotaAvailable,
+  incrementSerpapiUsage,
+  SerpapiQuotaExhaustedError,
+} from "./quota";
+import type {
+  Env,
+  FlightSearchResult,
+  SerpapiFlightOption,
+  SerpapiResponse,
+} from "./types";
 
 const SERPAPI_BASE = "https://serpapi.com/search";
 
@@ -9,6 +19,8 @@ export class SerpapiError extends Error {
     this.name = "SerpapiError";
   }
 }
+
+export { SerpapiQuotaExhaustedError };
 
 interface SearchContext {
   departureId: string;
@@ -36,39 +48,93 @@ function extractBookingUrl(
   return buildFallbackFlightsUrl(ctx);
 }
 
-function parsePrice(
-  data: SerpapiResponse,
-  ctx: SearchContext,
-): FlightSearchResult | null {
-  const bookingUrl = extractBookingUrl(data, ctx);
+export function countOptionStops(option: SerpapiFlightOption): number {
+  if (option.layovers && option.layovers.length > 0) {
+    return option.layovers.length;
+  }
+  const segments = option.flights?.length ?? 1;
+  return Math.max(0, segments - 1);
+}
 
-  const options = [...(data.best_flights ?? []), ...(data.other_flights ?? [])];
-  let cheapestFromOptions: FlightSearchResult | null = null;
+function maxStopsToSerpapiParam(maxStops: number): string {
+  if (maxStops <= 0) return "1";
+  if (maxStops === 1) return "2";
+  if (maxStops === 2) return "3";
+  // 3+ stops: API only filters to "2 or fewer" at best — fetch all and filter client-side
+  return "0";
+}
 
-  for (const option of options) {
-    if (option.price == null) continue;
-    if (!cheapestFromOptions || option.price < cheapestFromOptions.price) {
-      cheapestFromOptions = {
-        price: option.price,
-        airline: pickAirlineFromOption(option),
-        bookingUrl,
-      };
+export function extractOutboundPath(
+  option: SerpapiFlightOption,
+  origin: string,
+  destination: string,
+): string[] {
+  const flights = option.flights ?? [];
+  if (flights.length === 0) return [origin, destination];
+
+  const path: string[] = [];
+  for (const leg of flights) {
+    const dep = leg.departure_airport?.id?.toUpperCase();
+    const arr = leg.arrival_airport?.id?.toUpperCase();
+    if (dep) {
+      if (path.length === 0 || path[path.length - 1] !== dep) path.push(dep);
+    }
+    if (arr) {
+      path.push(arr);
+      if (arr === destination.toUpperCase()) break;
     }
   }
 
-  if (cheapestFromOptions) {
-    return cheapestFromOptions;
+  if (path.length < 2) return [origin.toUpperCase(), destination.toUpperCase()];
+  return path;
+}
+
+function optionToResult(
+  option: SerpapiFlightOption,
+  ctx: SearchContext,
+  bookingUrl: string,
+): FlightSearchResult {
+  return {
+    price: option.price!,
+    airline: pickAirlineFromOption(option),
+    bookingUrl,
+    stops: countOptionStops(option),
+    routePath: extractOutboundPath(option, ctx.departureId, ctx.arrivalId),
+    estimated: false,
+  };
+}
+
+function parseOptions(
+  data: SerpapiResponse,
+  ctx: SearchContext,
+  maxStops: number,
+  limit = OPTIONS_PER_SEARCH,
+): FlightSearchResult[] {
+  const bookingUrl = extractBookingUrl(data, ctx);
+  const results: FlightSearchResult[] = [];
+  const options = [...(data.best_flights ?? []), ...(data.other_flights ?? [])]
+    .filter((option) => option.price != null)
+    .sort((a, b) => (a.price ?? 0) - (b.price ?? 0));
+
+  for (const option of options) {
+    const stops = countOptionStops(option);
+    if (stops > maxStops) continue;
+    results.push(optionToResult(option, ctx, bookingUrl));
+    if (results.length >= limit) break;
   }
 
-  if (data.price_insights?.lowest_price != null) {
-    return {
+  if (results.length === 0 && data.price_insights?.lowest_price != null) {
+    results.push({
       price: data.price_insights.lowest_price,
       airline: pickAirline(data),
       bookingUrl,
-    };
+      stops: 0,
+      routePath: [ctx.departureId.toUpperCase(), ctx.arrivalId.toUpperCase()],
+      estimated: true,
+    });
   }
 
-  return null;
+  return results;
 }
 
 function pickAirline(data: SerpapiResponse): string {
@@ -86,12 +152,13 @@ function pickAirlineFromOption(option: {
   return "Unknown";
 }
 
-async function serpapiFetch(
+async function serpapiFetchOptions(
   env: Env,
   params: Record<string, string>,
   ctx: SearchContext,
   label: string,
-): Promise<FlightSearchResult | null> {
+  maxStops: number,
+): Promise<FlightSearchResult[]> {
   const url = new URL(SERPAPI_BASE);
   for (const [key, value] of Object.entries(params)) {
     url.searchParams.set(key, value);
@@ -100,8 +167,11 @@ async function serpapiFetch(
   url.searchParams.set("api_key", env.SERPAPI_KEY);
   url.searchParams.set("currency", "CAD");
   url.searchParams.set("adults", "1");
-  url.searchParams.set("stops", "2");
+  url.searchParams.set("stops", maxStopsToSerpapiParam(maxStops));
+  url.searchParams.set("sort_by", "2");
   url.searchParams.set("hl", "en");
+
+  await assertQuotaAvailable(env);
 
   const started = Date.now();
   console.log(
@@ -120,22 +190,26 @@ async function serpapiFetch(
     throw new SerpapiError(data.error ?? `Serpapi error for ${label}`);
   }
 
-  const parsed = parsePrice(data, ctx);
+  await incrementSerpapiUsage(env.PRICE_HISTORY);
+
+  const parsed = parseOptions(data, ctx, maxStops);
+  const best = parsed[0];
   console.log(
-    `[serpapi] ${label} done in ${durationMs}ms price=${parsed?.price ?? "none"} airline=${parsed?.airline ?? "n/a"} book=${parsed?.bookingUrl ? "yes" : "no"}`,
+    `[serpapi] ${label} done in ${durationMs}ms options=${parsed.length} best=${best?.price ?? "none"} stops=${best?.stops ?? "n/a"} airline=${best?.airline ?? "n/a"}`,
   );
 
   await sleep(API_DELAY_MS);
   return parsed;
 }
 
-export async function searchRoundTrip(
+export async function searchRoundTripOptions(
   env: Env,
   departureId: string,
   arrivalId: string,
   outboundDate: string,
   returnDate: string,
-): Promise<FlightSearchResult | null> {
+  maxStops: number,
+): Promise<FlightSearchResult[]> {
   const ctx: SearchContext = {
     departureId,
     arrivalId,
@@ -143,7 +217,7 @@ export async function searchRoundTrip(
     returnDate,
     roundTrip: true,
   };
-  return serpapiFetch(
+  return serpapiFetchOptions(
     env,
     {
       departure_id: departureId,
@@ -154,22 +228,24 @@ export async function searchRoundTrip(
     },
     ctx,
     `RT ${departureId}→${arrivalId} ${outboundDate}/${returnDate}`,
+    maxStops,
   );
 }
 
-export async function searchOneWay(
+export async function searchOneWayOptions(
   env: Env,
   departureId: string,
   arrivalId: string,
   outboundDate: string,
-): Promise<FlightSearchResult | null> {
+  maxStops: number,
+): Promise<FlightSearchResult[]> {
   const ctx: SearchContext = {
     departureId,
     arrivalId,
     outboundDate,
     roundTrip: false,
   };
-  return serpapiFetch(
+  return serpapiFetchOptions(
     env,
     {
       departure_id: departureId,
@@ -179,5 +255,6 @@ export async function searchOneWay(
     },
     ctx,
     `OW ${departureId}→${arrivalId} ${outboundDate}`,
+    maxStops,
   );
 }
