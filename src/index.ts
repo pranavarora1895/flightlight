@@ -20,7 +20,7 @@ import {
 } from "./auth";
 import { updateUserSettings } from "./db";
 import { EmailDeliveryError } from "./email";
-import { dashboardPage, loginPage, plainTextLog } from "./html";
+import { dashboardPage, loginPage } from "./html";
 import { getNextRunEstimate, listPriceRecords, runTracker } from "./tracker";
 import type { Env } from "./types";
 
@@ -191,9 +191,25 @@ app.get("/run", async (c) => {
     manual: true,
   });
 
-  return c.text(plainTextLog(result.log), 200, {
-    "Content-Type": "text/plain; charset=utf-8",
-  });
+  if (result.skipped) {
+    return c.redirect(
+      `/dashboard?error=${encodeURIComponent(result.skipReason ?? "Run skipped")}`,
+      302,
+    );
+  }
+
+  const nextLine = result.log.find((line) =>
+    line.startsWith("Next automatic check:"),
+  );
+  const nextRunAt = nextLine?.slice("Next automatic check: ".length);
+  const message = nextRunAt
+    ? `Price check complete. Next automatic check ${new Date(nextRunAt).toLocaleString()}.`
+    : "Price check complete.";
+
+  return c.redirect(
+    `/dashboard?message=${encodeURIComponent(message)}`,
+    302,
+  );
 });
 
 export default {

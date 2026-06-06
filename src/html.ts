@@ -325,7 +325,7 @@ function flightCards(records: KVRecord[], alertMax: number, route: { origin: str
   if (records.length === 0) {
     return `<div class="empty-state">
       <p>No flights tracked yet for ${escapeHtml(route.origin)} → ${escapeHtml(route.destination)}.</p>
-      <p class="hint" style="margin-top:8px;">Save your route below, then click <strong>Run now</strong>.</p>
+      <p class="hint" style="margin-top:8px;">Save your route below, then click <strong>Run now</strong> to check prices immediately. That resets the automatic schedule — only one check runs at a time.</p>
     </div>`;
   }
 
@@ -364,16 +364,16 @@ export function loginPage(error?: string, message?: string): string {
   const body = `
   <div class="login-wrap">
     <div class="card login-card">
-      <h1>✈️ Flight Tracker</h1>
-      <p class="muted">Track prices for your route. Sign in with your email and invite code.</p>
+      <h1>✈️ Flightlight</h1>
+      <p class="muted">Enter your email for a sign-in link. First-time users also need the family invite code.</p>
       <form method="post" action="/auth/login" class="stack" style="margin-top:20px;">
         <div>
           <label for="email">Email</label>
           <input id="email" name="email" type="email" required autocomplete="email" placeholder="you@example.com">
         </div>
         <div>
-          <label for="invite_code">Invite code</label>
-          <input id="invite_code" name="invite_code" type="password" required autocomplete="off" placeholder="Family invite code">
+          <label for="invite_code">Invite code <span class="muted" style="font-weight:400;">(new users only)</span></label>
+          <input id="invite_code" name="invite_code" type="password" autocomplete="off" placeholder="Leave blank if you've signed in before">
         </div>
         <button type="submit">Send sign-in link</button>
         ${error ? `<p class="error">${escapeHtml(error)}</p>` : ""}
@@ -381,7 +381,7 @@ export function loginPage(error?: string, message?: string): string {
       </form>
     </div>
   </div>`;
-  return layout("Sign in — Flight Tracker", body);
+  return layout("Sign in — Flightlight", body);
 }
 
 export function dashboardPage(ctx: DashboardContext, env: Env): string {
@@ -458,7 +458,7 @@ export function dashboardPage(ctx: DashboardContext, env: Env): string {
     </div>
   </div>`;
 
-  return layout(`Flights ${routeLabel} — Flight Tracker`, body);
+  return layout(`Flights ${routeLabel} — Flightlight`, body);
 }
 
 function formatNextRun(value: string): string {

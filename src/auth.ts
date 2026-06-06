@@ -8,6 +8,7 @@ import {
   createMagicLink,
   createSession,
   deleteSession,
+  getUserByEmail,
   getUserBySessionToken,
   upsertUser,
 } from "./db";
@@ -122,11 +123,21 @@ export async function loginWithInvite(
     return { ok: false, error: "Enter a valid email address." };
   }
 
-  if (inviteCode.trim() !== env.INVITE_CODE) {
-    return { ok: false, error: "Invalid invite code." };
+  const existing = await getUserByEmail(env.DB, email);
+  let user: User;
+
+  if (existing) {
+    user = existing;
+  } else {
+    if (inviteCode.trim() !== env.INVITE_CODE) {
+      return {
+        ok: false,
+        error: "Invalid invite code. New users need the family invite code.",
+      };
+    }
+    user = await upsertUser(env.DB, email);
   }
 
-  const user = await upsertUser(env.DB, email);
   const token = await createMagicLink(env.DB, user.email, MAGIC_LINK_MINUTES);
   const verifyUrl = `${env.APP_URL}/auth/verify?token=${encodeURIComponent(token)}`;
 

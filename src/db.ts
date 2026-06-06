@@ -15,6 +15,18 @@ export function userRoute(user: User): UserRoute {
   };
 }
 
+export async function getUserByEmail(
+  db: D1Database,
+  email: string,
+): Promise<User | null> {
+  const normalized = email.trim().toLowerCase();
+  const user = await db
+    .prepare("SELECT * FROM users WHERE email = ?")
+    .bind(normalized)
+    .first<User>();
+  return user ? normalizeUser(user) : null;
+}
+
 export async function upsertUser(
   db: D1Database,
   email: string,

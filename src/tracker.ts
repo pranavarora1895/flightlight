@@ -24,6 +24,8 @@ import type {
 } from "./types";
 
 const ALERT_DEDUP_TTL = 86_400;
+const RUN_LOCK_KEY = "tracker:runLock";
+const RUN_LOCK_TTL_SECONDS = 900; // 15 min — longer than any single run
 
 function buildDomesticBookUrl(from: string, to: string, date: string): string {
   const q = `Flights from ${from} to ${to} on ${date}`;
@@ -51,6 +53,23 @@ async function setTrackerState(
 
 async function getLastRunAt(kv: KVNamespace): Promise<string | null> {
   return kv.get("tracker:lastRunAt");
+}
+
+async function tryAcquireRunLock(kv: KVNamespace): Promise<boolean> {
+  const existing = await kv.get(RUN_LOCK_KEY);
+  if (existing) return false;
+  await kv.put(RUN_LOCK_KEY, new Date().toISOString(), {
+    expirationTtl: RUN_LOCK_TTL_SECONDS,
+  });
+  return true;
+}
+
+async function releaseRunLock(kv: KVNamespace): Promise<void> {
+  await kv.delete(RUN_LOCK_KEY);
+}
+
+function formatNextRunFromLast(lastRunAt: string, intervalMs: number): string {
+  return new Date(new Date(lastRunAt).getTime() + intervalMs).toISOString();
 }
 
 export async function getNextRunEstimate(env: Env): Promise<string | null> {
@@ -366,71 +385,89 @@ export async function runTracker(
       log.push(`Skipped: ${skipReason}`);
       return { skipped: true, skipReason, log, deals: [], searchCount: 0, tier };
     }
-  } else if (options.manual && tier === "free") {
+  } else if (options.manual) {
+    log.push("Manual run — automatic schedule resets after this completes.");
+  } else if (tier === "free") {
     log.push("Manual run on free tier — watch Serpapi quota.");
   }
 
-  const users = await getActiveUsers(env.DB);
-  if (users.length === 0) {
-    log.push("No active users.");
-    return { skipped: false, log, deals: [], searchCount: 0, tier };
+  const lockAcquired = await tryAcquireRunLock(env.PRICE_HISTORY);
+  if (!lockAcquired) {
+    const skipReason = options.manual
+      ? "A price check is already running. Try again in a few minutes."
+      : "Skipped: another run is already in progress";
+    log.push(skipReason);
+    return { skipped: true, skipReason, log, deals: [], searchCount: 0, tier };
   }
 
-  const returnIndex = await getTrackerState(
-    env.PRICE_HISTORY,
-    "tracker:returnDateIndex",
-    0,
-  );
-  const retDate = RETURN_DATES[returnIndex % RETURN_DATES.length];
-  const runDate = todayUtc();
-  const allDeals: Deal[] = [];
+  try {
+    const users = await getActiveUsers(env.DB);
+    if (users.length === 0) {
+      log.push("No active users.");
+      return { skipped: false, log, deals: [], searchCount: 0, tier };
+    }
 
-  log.push(`Return date: ${retDate}`);
-
-  for (const user of users) {
-    const hubIndex = await getTrackerState(
+    const returnIndex = await getTrackerState(
       env.PRICE_HISTORY,
-      `tracker:hubIndex:${user.id}`,
+      "tracker:returnDateIndex",
       0,
     );
+    const retDate = RETURN_DATES[returnIndex % RETURN_DATES.length];
+    const runDate = todayUtc();
+    const allDeals: Deal[] = [];
 
-    const result = await runForUser(
-      env,
-      user,
-      profile,
-      retDate,
-      runDate,
-      hubIndex,
-      log,
-    );
-    searchCount += result.searchCount;
-    allDeals.push(...result.deals);
+    log.push(`Return date: ${retDate}`);
 
-    if (profile.hubsPerRun === "rotate") {
-      await setTrackerState(
+    for (const user of users) {
+      const hubIndex = await getTrackerState(
         env.PRICE_HISTORY,
         `tracker:hubIndex:${user.id}`,
-        result.nextHubIndex,
+        0,
       );
+
+      const result = await runForUser(
+        env,
+        user,
+        profile,
+        retDate,
+        runDate,
+        hubIndex,
+        log,
+      );
+      searchCount += result.searchCount;
+      allDeals.push(...result.deals);
+
+      if (profile.hubsPerRun === "rotate") {
+        await setTrackerState(
+          env.PRICE_HISTORY,
+          `tracker:hubIndex:${user.id}`,
+          result.nextHubIndex,
+        );
+      }
+
+      try {
+        await dispatchAlertsForUser(env, user, result.deals, log);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        log.push(`Alert error for ${user.email}: ${message}`);
+        console.error("[tracker] alert failed", error);
+      }
     }
 
-    try {
-      await dispatchAlertsForUser(env, user, result.deals, log);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      log.push(`Alert error for ${user.email}: ${message}`);
-      console.error("[tracker] alert failed", error);
-    }
+    const lastRunAt = new Date().toISOString();
+    await env.PRICE_HISTORY.put("tracker:lastRunAt", lastRunAt);
+    await setTrackerState(
+      env.PRICE_HISTORY,
+      "tracker:returnDateIndex",
+      (returnIndex + 1) % RETURN_DATES.length,
+    );
+
+    const nextRunAt = formatNextRunFromLast(lastRunAt, profile.runIntervalMs);
+    log.push(`Completed ${searchCount} Serpapi searches, ${allDeals.length} deals saved.`);
+    log.push(`Next automatic check: ${nextRunAt}`);
+
+    return { skipped: false, log, deals: allDeals, searchCount, tier };
+  } finally {
+    await releaseRunLock(env.PRICE_HISTORY);
   }
-
-  await env.PRICE_HISTORY.put("tracker:lastRunAt", new Date().toISOString());
-  await setTrackerState(
-    env.PRICE_HISTORY,
-    "tracker:returnDateIndex",
-    (returnIndex + 1) % RETURN_DATES.length,
-  );
-
-  log.push(`Completed ${searchCount} Serpapi searches, ${allDeals.length} deals saved.`);
-
-  return { skipped: false, log, deals: allDeals, searchCount, tier };
 }

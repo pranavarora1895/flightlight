@@ -115,7 +115,7 @@ export async function sendMagicLinkEmail(
 <html>
 <body style="font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; padding: 32px;">
   <div style="max-width: 480px; margin: 0 auto; background: #1e293b; border-radius: 12px; padding: 32px;">
-    <h1 style="margin: 0 0 8px; font-size: 22px;">YYT → DEL Flight Tracker</h1>
+    <h1 style="margin: 0 0 8px; font-size: 22px;">✈️ Flightlight</h1>
     <p style="color: #94a3b8; margin: 0 0 24px;">Sign in to view prices and manage your alert range.</p>
     <a href="${verifyUrl}" style="display: inline-block; background: #22c55e; color: #052e16; text-decoration: none; font-weight: 600; padding: 12px 24px; border-radius: 8px;">Sign in</a>
     <p style="color: #64748b; font-size: 13px; margin-top: 24px;">This link expires in 15 minutes. If you didn't request this, ignore this email.</p>
@@ -123,7 +123,7 @@ export async function sendMagicLinkEmail(
 </body>
 </html>`;
 
-  await sendEmail(env, to, "Sign in to YYT→DEL Flight Tracker", html);
+  await sendEmail(env, to, "Sign in to Flightlight", html);
 }
 
 function routeLabel(d: Deal): string {
@@ -216,7 +216,7 @@ export async function sendDealAlertEmail(
 <html>
 <body style="font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; padding: 24px;">
   <div style="max-width: 720px; margin: 0 auto;">
-    <h1 style="font-size: 20px; margin-bottom: 8px;">Deals in your alert range</h1>
+    <h1 style="font-size: 20px; margin-bottom: 8px;">Flightlight — deals in your alert range</h1>
     <p style="color: #94a3b8; margin-top: 0;">Found ${sorted.length} option${sorted.length === 1 ? "" : "s"} matching your settings.</p>
     ${dealsTableHtml(sorted)}
     ${footer}
